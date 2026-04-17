@@ -9,7 +9,6 @@ import httpx
 
 from exchanges.hyperliquid.adapter import HyperliquidAdapter
 from interfaces.exchange import Order, OrderSide as LegacyOrderSide, OrderType
-from interfaces.strategy import Position as LegacyPos
 from litebot.interfaces import Exchange, MicroGap, OrderBookDepth, OrderSide, PositionState
 from litebot.jit_kernels import micro_gap_bps
 
@@ -31,6 +30,10 @@ class LiteHyperliquidExchange(Exchange):
         self._last_order_error: str | None = None
         self._symbol = symbol
         self._leverage = max(1, int(leverage))
+        self._mids_cache: tuple[float, dict[str, Any]] | None = None
+        self._meta_ctx_cache: tuple[float, list[Any]] | None = None
+        self._user_state_cache: tuple[float, dict[str, Any]] | None = None
+        self._book_cache: dict[str, tuple[float, OrderBookDepth]] = {}
 
     async def connect(self) -> bool:
         ok = await self._adapter.connect()
@@ -65,8 +68,67 @@ class LiteHyperliquidExchange(Exchange):
         r.raise_for_status()
         return r.json()
 
+    async def _get_all_mids_cached(self, ttl_s: float = 0.5) -> dict[str, Any]:
+        now = time.time()
+        if self._mids_cache and (now - self._mids_cache[0]) <= ttl_s:
+            return self._mids_cache[1]
+        try:
+            mids = await self._post_info({"type": "allMids"})
+            if isinstance(mids, dict):
+                self._mids_cache = (now, mids)
+                return mids
+        except Exception:
+            if self._mids_cache:
+                return self._mids_cache[1]
+            raise
+        if self._mids_cache:
+            return self._mids_cache[1]
+        return {}
+
+    async def _get_meta_ctx_cached(self, ttl_s: float = 3.0) -> list[Any]:
+        now = time.time()
+        if self._meta_ctx_cache and (now - self._meta_ctx_cache[0]) <= ttl_s:
+            return self._meta_ctx_cache[1]
+        try:
+            meta_ctx = await self._post_info({"type": "metaAndAssetCtxs"})
+            if isinstance(meta_ctx, list):
+                self._meta_ctx_cache = (now, meta_ctx)
+                return meta_ctx
+        except Exception:
+            if self._meta_ctx_cache:
+                return self._meta_ctx_cache[1]
+            raise
+        if self._meta_ctx_cache:
+            return self._meta_ctx_cache[1]
+        return []
+
+    async def _get_user_state_cached(self, ttl_s: float = 0.8) -> dict[str, Any]:
+        now = time.time()
+        if self._user_state_cache and (now - self._user_state_cache[0]) <= ttl_s:
+            return self._user_state_cache[1]
+        try:
+            if not self._adapter.exchange or not self._adapter.info:
+                return {}
+            state = self._adapter.info.user_state(self._adapter.exchange.wallet.address)
+            if isinstance(state, dict):
+                self._user_state_cache = (now, state)
+                return state
+        except Exception:
+            if self._user_state_cache:
+                return self._user_state_cache[1]
+            raise
+        if self._user_state_cache:
+            return self._user_state_cache[1]
+        return {}
+
     async def get_orderbook_depth(self, symbol: str, depth_levels: int) -> OrderBookDepth:
-        data = await self._post_info({"type": "l2Book", "coin": symbol})
+        try:
+            data = await self._post_info({"type": "l2Book", "coin": symbol})
+        except Exception:
+            cached = self._book_cache.get(symbol)
+            if cached:
+                return cached[1]
+            raise
         levels = data.get("levels") or [[], []]
         bids = levels[0] if len(levels) > 0 else []
         asks = levels[1] if len(levels) > 1 else []
@@ -83,7 +145,7 @@ class LiteHyperliquidExchange(Exchange):
         bb_px, bb_sz, bid_d = _sum_sz(bids, depth_levels)
         ba_px, ba_sz, ask_d = _sum_sz(asks, depth_levels)
 
-        return OrderBookDepth(
+        depth = OrderBookDepth(
             symbol=symbol,
             best_bid_px=bb_px,
             best_ask_px=ba_px,
@@ -93,11 +155,21 @@ class LiteHyperliquidExchange(Exchange):
             ask_depth_n=ask_d,
             timestamp=now,
         )
+        self._book_cache[symbol] = (now, depth)
+        return depth
 
     async def get_micro_gap(self, symbol: str) -> MicroGap:
-        mids = await self._post_info({"type": "allMids"})
+        mids = await self._get_all_mids_cached()
         mid = float(mids.get(symbol, 0) or 0)
-        ma = await self._post_info({"type": "metaAndAssetCtxs"})
+        ma = await self._get_meta_ctx_cached()
+        if len(ma) < 2:
+            return MicroGap(
+                symbol=symbol,
+                mid=mid,
+                mark=mid,
+                gap_bps=0.0,
+                timestamp=time.time(),
+            )
         meta, ctxs = ma[0], ma[1]
         universe = meta.get("universe", [])
         idx = next((i for i, u in enumerate(universe) if u.get("name") == symbol), None)
@@ -141,36 +213,41 @@ class LiteHyperliquidExchange(Exchange):
         return err
 
     async def get_position_state(self, symbol: str) -> PositionState:
-        positions = await self._adapter.get_positions()
-
-        for p in positions:
-            if isinstance(p, LegacyPos) and p.asset == symbol:
-                cur = await self._adapter.get_market_price(symbol)
-                return PositionState(
-                    symbol=symbol,
-                    size=float(p.size),
-                    entry_price=float(p.entry_price),
-                    current_price=float(cur),
-                    opened_at=float(p.timestamp),
-                )
-        cur = await self._adapter.get_market_price(symbol)
+        user_state = await self._get_user_state_cached()
+        mids = await self._get_all_mids_cached()
+        cur = float(mids.get(symbol, 0) or 0)
+        for pos_info in user_state.get("assetPositions") or []:
+            position = pos_info.get("position") if isinstance(pos_info, dict) else None
+            if not isinstance(position, dict):
+                continue
+            if position.get("coin") != symbol:
+                continue
+            size = float(position.get("szi", 0) or 0)
+            if abs(size) <= 1e-12:
+                continue
+            entry = float(position.get("entryPx") or 0)
+            return PositionState(
+                symbol=symbol,
+                size=size,
+                entry_price=entry,
+                current_price=cur if cur > 0 else entry,
+                opened_at=time.time(),
+            )
         return PositionState(
             symbol=symbol,
             size=0.0,
-            entry_price=cur,
-            current_price=cur,
+            entry_price=cur if cur > 0 else 0.0,
+            current_price=cur if cur > 0 else 0.0,
             opened_at=time.time(),
         )
 
     async def get_cash_balance(self) -> float:
-        for asset in ("USDC", "USD"):
-            try:
-                b = await self._adapter.get_balance(asset)
-                if b.total > 0 or b.available > 0:
-                    return float(b.available)
-            except Exception:
-                continue
-        return 0.0
+        user_state = await self._get_user_state_cached()
+        withdrawable = float(user_state.get("withdrawable", 0) or 0)
+        if withdrawable > 0:
+            return withdrawable
+        ms = user_state.get("marginSummary") or user_state.get("crossMarginSummary") or {}
+        return float(ms.get("accountValue", 0) or 0)
 
     async def close_position(self, symbol: str, size: float | None = None) -> bool:
         self._last_order_error = None

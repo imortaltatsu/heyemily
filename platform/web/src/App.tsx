@@ -160,6 +160,14 @@ function extractLivePnl(events: { kind: string; ts: number; data?: object }[]): 
   return null;
 }
 
+function extractPerpWithdrawableLimit(error: unknown): number | null {
+  const raw = String(error ?? "");
+  const match = raw.match(/exceeds perp withdrawable \(([-+]?\d*\.?\d+)\)/i);
+  if (!match) return null;
+  const cap = Number.parseFloat(match[1]);
+  return Number.isFinite(cap) && cap > 0 ? cap : null;
+}
+
 export default function App() {
   const [signInBusy, setSignInBusy] = useState(false);
   const [token, setToken] = useState<string | null>(localStorage.getItem("hft_token"));
@@ -374,6 +382,21 @@ export default function App() {
       await usdClassTransfer(token, selected, { to_perp: false, amount });
       await onLookupHyperliquidBalance();
     } catch (e) {
+      const cap = extractPerpWithdrawableLimit(e);
+      if (cap !== null && cap < amount) {
+        try {
+          await usdClassTransfer(token, selected, { to_perp: false, amount: cap });
+          setPerpToSpotAmount(String(cap));
+          setErr(
+            `Adjusted to latest withdrawable (${cap}) because requested amount (${amount}) was higher.`,
+          );
+          await onLookupHyperliquidBalance();
+          return;
+        } catch (retryErr) {
+          setErr(String(retryErr));
+          return;
+        }
+      }
       setErr(String(e));
     } finally {
       setHlTransferBusy(false);
@@ -381,7 +404,13 @@ export default function App() {
   };
 
   const onMovePerpToSpotMax = async () => {
-    const w = hlMargin ? Number.parseFloat(hlMargin.withdrawable) : NaN;
+    if (!token || !selected) return;
+    const latest = await getHyperliquidBalance(token, selected).catch(() => null);
+    if (latest) {
+      setHlMargin(latest.margin);
+      setHlSpot(latest.spot_balances ?? []);
+    }
+    const w = latest ? Number.parseFloat(latest.margin.withdrawable) : hlMargin ? Number.parseFloat(hlMargin.withdrawable) : NaN;
     if (!Number.isFinite(w) || w <= 0) {
       setErr("Load balances first, or there is no withdrawable perp USDC to move.");
       return;
@@ -616,6 +645,7 @@ export default function App() {
 
   const hlAppOrigin = sessionUsesTestnet ? "https://app.hyperliquid-testnet.xyz" : "https://app.hyperliquid.xyz";
   const livePnlUsd = useMemo(() => extractLivePnl(live), [live]);
+  const spotUsdcRow = useMemo(() => hlSpot.find((row) => row.coin === "USDC") ?? null, [hlSpot]);
   const marginAccountValueUsd = useMemo(
     () => (hlMargin ? Number.parseFloat(hlMargin.account_value) : Number.NaN),
     [hlMargin],
@@ -1091,11 +1121,59 @@ export default function App() {
               </div>
 
               <div className="card">
-                <h2>Credentials (encrypted at rest)</h2>
+                <h2>Wallet management</h2>
                 <p style={{ fontSize: 14, opacity: 0.85 }}>
                   Either let the platform <strong>spawn a custodial EVM wallet</strong> (Hyperliquid API account) and
                   encrypt it with the master key, or paste your own key once.
                 </p>
+                <div
+                  style={{
+                    marginBottom: 12,
+                    padding: 12,
+                    borderRadius: 8,
+                    border: "1px solid rgba(255,255,255,0.14)",
+                    background: "rgba(0,0,0,0.2)",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 8,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <strong style={{ fontSize: 14 }}>Wallet balance (always visible)</strong>
+                    <button type="button" disabled={hlBalanceBusy} onClick={() => void onLookupHyperliquidBalance()}>
+                      {hlBalanceBusy ? "Loading…" : "Refresh wallet balance"}
+                    </button>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 8, marginTop: 10 }}>
+                    <div style={{ fontSize: 13 }}>
+                      <div style={{ opacity: 0.75 }}>Account value</div>
+                      <div style={{ fontVariantNumeric: "tabular-nums" }}>
+                        {hlMargin?.account_value ?? "—"} USDC
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 13 }}>
+                      <div style={{ opacity: 0.75 }}>Withdrawable</div>
+                      <div style={{ fontVariantNumeric: "tabular-nums" }}>
+                        {hlMargin?.withdrawable ?? "—"} USDC
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 13 }}>
+                      <div style={{ opacity: 0.75 }}>Open positions</div>
+                      <div style={{ fontVariantNumeric: "tabular-nums" }}>{hlMargin?.open_positions ?? "—"}</div>
+                    </div>
+                    <div style={{ fontSize: 13 }}>
+                      <div style={{ opacity: 0.75 }}>Spot USDC available</div>
+                      <div style={{ fontVariantNumeric: "tabular-nums" }}>
+                        {spotUsdcRow ? spotAvailable(spotUsdcRow.total, spotUsdcRow.hold) : "—"}
+                      </div>
+                    </div>
+                  </div>
+                </div>
                 {!selectedSession?.custodial_address ? (
                   <div style={{ marginBottom: 12 }}>
                     <button type="button" disabled={provisionBusy} onClick={() => void onProvisionCustodial()}>
@@ -1135,6 +1213,17 @@ export default function App() {
                 <p style={{ fontSize: 12, opacity: 0.75, marginTop: 6, marginBottom: 0 }}>
                   Export uses your authenticated session and copies the decrypted key directly to clipboard.
                 </p>
+                <div style={{ marginTop: 10 }}>
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={closeAllBusy}
+                    onClick={() => void onCloseAllOrders()}
+                    title="Cancel all open orders and submit reduce-only closes for all open positions"
+                  >
+                    {closeAllBusy ? "Closing…" : "Close all orders"}
+                  </button>
+                </div>
               </div>
 
               <div className="card">
@@ -1149,16 +1238,6 @@ export default function App() {
                 </button>{" "}
                 <button type="button" onClick={onStop}>
                   Stop
-                </button>
-                <button
-                  type="button"
-                  className="danger"
-                  disabled={closeAllBusy}
-                  onClick={() => void onCloseAllOrders()}
-                  style={{ marginLeft: 8 }}
-                  title="Cancel all open orders and submit reduce-only closes for all open positions"
-                >
-                  {closeAllBusy ? "Closing…" : "Close all orders"}
                 </button>
                 {workerInfo && (
                   <pre

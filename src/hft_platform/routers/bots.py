@@ -152,6 +152,14 @@ def _sync_close_all_orders_and_positions(private_key: str, testnet: bool) -> dic
 
     user_state_raw = info.user_state(wallet.address) or {}
     user_state = user_state_raw if isinstance(user_state_raw, dict) else {}
+    # Some environments expose active perps in clearinghouseState but not user_state.
+    if not isinstance(user_state.get("assetPositions"), list) or not user_state.get("assetPositions"):
+        try:
+            ch = API(base_url=base).post("/info", {"type": "clearinghouseState", "user": wallet.address})
+            if isinstance(ch, dict) and isinstance(ch.get("assetPositions"), list):
+                user_state["assetPositions"] = ch.get("assetPositions") or []
+        except Exception as e:
+            position_close_errors.append({"error": f"clearinghouse_fallback_failed: {e}"})
     mids_raw = info.all_mids() or {}
     mids = mids_raw if isinstance(mids_raw, dict) else {}
     for pos in user_state.get("assetPositions") or []:

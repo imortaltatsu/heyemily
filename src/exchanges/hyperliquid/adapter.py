@@ -451,11 +451,9 @@ class HyperliquidAdapter(ExchangeAdapter):
     async def close_position(self, asset: str, size: Optional[float] = None) -> bool:
         """Close a position by placing a market order"""
         if not self.is_connected:
-            return False
+            raise RuntimeError("Not connected to exchange")
 
         try:
-            from hyperliquid.utils.signing import OrderType as HLOrderType
-
             # Get current positions to determine position details
             positions = await self.get_positions()
             target_position = None
@@ -466,8 +464,7 @@ class HyperliquidAdapter(ExchangeAdapter):
                     break
 
             if not target_position:
-                print(f"❌ No position found for {asset}")
-                return False
+                raise RuntimeError(f"No position found for {asset}")
 
             # Determine close size
             if size is None:
@@ -476,53 +473,32 @@ class HyperliquidAdapter(ExchangeAdapter):
                 close_size = min(size, abs(target_position.size))
             close_size = round(float(close_size), 5)
             if close_size <= 0:
-                print(f"❌ Close size for {asset} is non-positive: {close_size}")
-                return False
+                raise RuntimeError(f"Close size for {asset} is non-positive: {close_size}")
 
-            # Determine side (opposite of current position): long->sell, short->buy
-            close_is_buy = target_position.size < 0
-
-            # Use an aggressive IOC limit around current mid to behave like market close.
-            market_price = await self.get_market_price(asset)
-            if market_price <= 0:
-                print(f"❌ Invalid market price for {asset}: {market_price}")
-                return False
-            if asset == "BTC":
-                ioc_price = float(int(market_price * (1.01 if close_is_buy else 0.99)))
-            else:
-                ioc_price = round(float(market_price * (1.01 if close_is_buy else 0.99)), 2)
-
-            result = self.exchange.order(
-                name=asset,
-                is_buy=close_is_buy,
-                sz=close_size,
-                limit_px=ioc_price,
-                order_type=HLOrderType({"limit": {"tif": "Ioc"}}),
-                reduce_only=True,
-            )
+            # Use SDK-native market_close for robust flatten semantics.
+            result = self.exchange.market_close(asset, sz=close_size, slippage=0.08)
 
             if not (result and isinstance(result, dict) and result.get("status") == "ok"):
-                print(f"❌ Failed to close position: {result}")
-                return False
+                raise RuntimeError(f"Failed to close position: {result}")
 
             response_data = result.get("response", {}).get("data", {})
             statuses = response_data.get("statuses", [])
             if not statuses:
-                print(f"❌ Close order returned no statuses: {result}")
-                return False
+                raise RuntimeError(f"Close order returned no statuses: {result}")
             status_info = statuses[0]
-            if status_info == "success" or "filled" in status_info or "resting" in status_info:
+            if status_info == "success":
                 print(f"✅ Position close order placed: {close_size} {asset}")
                 return True
-            if "error" in status_info:
-                print(f"❌ Close order error for {asset}: {status_info['error']}")
-                return False
-            print(f"❌ Unknown close status for {asset}: {status_info}")
-            return False
+            if isinstance(status_info, dict) and ("filled" in status_info or "resting" in status_info):
+                print(f"✅ Position close order placed: {close_size} {asset}")
+                return True
+            if isinstance(status_info, dict) and "error" in status_info:
+                raise RuntimeError(f"Close order error for {asset}: {status_info['error']}")
+            raise RuntimeError(f"Unknown close status for {asset}: {status_info}")
 
         except Exception as e:
             print(f"❌ Error closing position {asset}: {e}")
-            return False
+            raise
 
     async def get_account_metrics(self) -> Dict[str, Any]:
         """Get account-level metrics for risk assessment"""

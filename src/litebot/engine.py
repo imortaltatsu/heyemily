@@ -27,6 +27,7 @@ from litebot.strategy_micro_arb import MicroArbStrategy, strategy_config_from_li
 from litebot.telemetry import TelemetryHub
 
 MIN_ORDER_USD = 10.0
+CLOSE_IMPL_VERSION = "market_close_v2"
 
 
 class LiteHFTEngine:
@@ -81,7 +82,7 @@ class LiteHFTEngine:
                 time.time(),
                 self._session_id,
                 self.cfg.symbol,
-                {"testnet": self.cfg.testnet},
+                {"testnet": self.cfg.testnet, "close_impl": CLOSE_IMPL_VERSION},
             )
         )
 
@@ -211,10 +212,18 @@ class LiteHFTEngine:
                 return
             success = await self._exchange.close_position(sym, None)
             err_msg = self._exchange.pop_last_order_error() if not success else None
+            if not success and not err_msg:
+                err_msg = "close_failed_no_error"
             if success:
                 self._risk.record_order_submitted()
                 self._entry_ts = None
-            await self._emit_order_telemetry("close", success, now, error=err_msg)
+            await self._emit_order_telemetry(
+                "close",
+                success,
+                now,
+                error=err_msg,
+                extra={"close_impl": CLOSE_IMPL_VERSION},
+            )
             return
 
         ib_ms = self.cfg.interval_buy_ms or 0
@@ -407,12 +416,15 @@ class LiteHFTEngine:
         now: float,
         side: str | None = None,
         error: str | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         data: dict[str, Any] = {"success": success}
         if side:
             data["side"] = side
         if error:
             data["error"] = error
+        if extra:
+            data.update(extra)
         await self.telemetry.emit(
             MetricsEvent(kind, now, self._session_id, self.cfg.symbol, data)
         )
