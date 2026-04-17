@@ -1,0 +1,34 @@
+# Lite HFT micro-arbitrage worker (single-exchange, sub-second holds)
+# Use with: uv run python src/run_lite_worker.py --config bots/lite_hft_micro_arb.yaml
+# For a fixed cadence of market buys (e.g. one per second), see bots/lite_1_buy_per_sec.yaml (`interval_buy_ms`).
+# Requires LITEBOT_PRIVATE_KEY in .env for local runs.
+
+name: "lite_hft_micro_arb"
+active: false
+
+symbol: "BTC"
+testnet: true
+
+loop_interval_ms: 100
+hold_timeout_ms: 800
+imbalance_threshold: 0.35
+micro_gap_min_bps: 1.0
+order_size_usd: 50.0
+depth_levels: 5
+cooldown_ms: 150
+
+risk:
+  max_orders_per_second: 5
+  max_open_notional_usd: 5000
+  max_position_per_symbol_usd: 2000
+  max_consecutive_losses: 8
+  max_daily_realized_loss_usd: 500
+  kill_switch: false
+
+telemetry:
+  push_url: null
+  push_token: null
+  session_id: null
+  buffer_max: 500
+  # Set false to skip per-tick dashboard events (less Python overhead on hot path)
+  emit_tick_events: true

@@ -1,0 +1,36 @@
+# ~1 market BUY per second (60 buys / minute) while the worker runs.
+# Uses interval_buy_ms (micro-arb entries disabled; strategy can still emit CLOSE).
+# Raise notional caps if you pyramid (interval_buy_flat_only: false).
+
+name: "lite_1_buy_per_sec"
+active: false
+
+symbol: "BTC"
+testnet: true
+
+loop_interval_ms: 100
+interval_buy_ms: 1000
+interval_buy_flat_only: false
+
+# Still used for CLOSE logic when you have a position; keep small if you want fast flips.
+hold_timeout_ms: 800
+imbalance_threshold: 0.35
+micro_gap_min_bps: 1.0
+order_size_usd: 10.0
+depth_levels: 5
+cooldown_ms: 150
+
+risk:
+  max_orders_per_second: 3
+  max_open_notional_usd: 500000
+  max_position_per_symbol_usd: 250000
+  max_consecutive_losses: 99
+  max_daily_realized_loss_usd: 100000
+  kill_switch: false
+
+telemetry:
+  push_url: null
+  push_token: null
+  session_id: null
+  buffer_max: 500
+  emit_tick_events: false
